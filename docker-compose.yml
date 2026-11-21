@@ -1,0 +1,68 @@
+networks:
+  lakehouse:
+    driver: bridge
+
+volumes:
+  rustfs_data:
+  postgres_gold_data:
+  superset_data:
+
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: rustfs
+    networks: [lakehouse]
+    ports:
+      - "9000:9000"   # API S3 (usada pelo Python/boto3)
+      - "9001:9001"   # Interface Web (http://localhost:9001)
+    environment:
+      RUSTFS_VOLUMES: "/data"
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: admin
+      RUSTFS_SECRET_KEY: admin123
+    volumes:
+      - rustfs_data:/data
+
+  postgres-gold:
+    image: postgres:15-alpine
+    container_name: postgres-gold
+    networks: [lakehouse]
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: dw_vendas
+      POSTGRES_USER: vendas
+      POSTGRES_PASSWORD: vendas123
+    volumes:
+      - postgres_gold_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vendas -d dw_vendas"]
+      interval: 10s
+      retries: 5
+
+  superset:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    image: superset-postgres:local
+    container_name: superset
+    networks: [lakehouse]
+    depends_on:
+      postgres-gold:
+        condition: service_healthy
+    ports:
+      - "8088:8088"
+    environment:
+      SUPERSET_SECRET_KEY: "vendas-lakehouse-secret-ufal"
+      SUPERSET_LOAD_EXAMPLES: "no"
+    volumes:
+      - superset_data:/app/superset_home
+    command: >
+      /bin/sh -c "
+        superset db upgrade &&
+        superset fab create-admin --username admin --firstname Admin --lastname User --email admin@ufal.br --password admin || true &&
+        superset init &&
+        superset run -h 0.0.0.0 -p 8088
+      "
