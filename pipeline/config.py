@@ -5,8 +5,29 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 RAW_DIR = BASE_DIR / "data" / "raw"
 
+
+def _carregar_env(caminho: Path) -> None:
+    """Lê um arquivo .env simples (CHAVE=valor) sem sobrescrever variáveis já definidas.
+
+    O mesmo .env é lido pelo docker compose, então portas customizadas valem
+    para os containers e para o pipeline ao mesmo tempo.
+    """
+    if not caminho.exists():
+        return
+    for linha in caminho.read_text(encoding="utf-8").splitlines():
+        linha = linha.strip()
+        if not linha or linha.startswith("#") or "=" not in linha:
+            continue
+        chave, valor = linha.split("=", 1)
+        os.environ.setdefault(chave.strip(), valor.strip().strip('"').strip("'"))
+
+
+_carregar_env(BASE_DIR / ".env")
+
 # RustFS (Object Storage S3)
-S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "http://localhost:9000")
+S3_ENDPOINT = os.environ.get(
+    "S3_ENDPOINT", f"http://localhost:{os.environ.get('S3_API_PORT', '9000')}"
+)
 S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY", "admin")
 S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "admin123")
 

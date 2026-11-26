@@ -1,22 +1,11 @@
-import io
 import logging
-from datetime import date
 
-import boto3
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 import sqlalchemy
-from botocore.config import Config
+from sqlalchemy import BigInteger, Boolean, Date, Integer, Numeric, SmallInteger, Text
 
-from config import (
-    S3_ENDPOINT,
-    S3_ACCESS_KEY,
-    S3_SECRET_KEY,
-    BUCKET_PRATA,
-    BUCKET_OURO,
-    POSTGRES_URI,
-)
+from config import BUCKET_PRATA, BUCKET_OURO, POSTGRES_URI
+from storage import chave_particao, get_s3, gravar_parquet, ler_parquet, resolver_particao
 
 log = logging.getLogger(__name__)
 
@@ -31,16 +20,43 @@ DIAS_PT = {
     3: "Quinta", 4: "Sexta", 5: "Sábado", 6: "Domingo",
 }
 
+DINHEIRO = Numeric(12, 2)
 
-def get_s3():
-    return boto3.client(
-        "s3",
-        endpoint_url=S3_ENDPOINT,
-        aws_access_key_id=S3_ACCESS_KEY,
-        aws_secret_access_key=S3_SECRET_KEY,
-        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
-        region_name="us-east-1",
-    )
+# Tipos explícitos no PostgreSQL (valores monetários em NUMERIC, não em ponto flutuante)
+TIPOS_SQL = {
+    "dim_tempo": {
+        "sk_data": Integer(), "dt_data": Date(), "nr_ano": SmallInteger(),
+        "nr_mes": SmallInteger(), "nr_dia": SmallInteger(), "nr_trimestre": SmallInteger(),
+        "ds_trimestre": Text(), "nm_mes": Text(), "ds_ano_mes": Text(),
+        "nr_dia_semana": SmallInteger(), "ds_dia_semana": Text(), "fl_fim_semana": Boolean(),
+    },
+    "dim_loja": {
+        "sk_loja": Integer(), "nm_loja": Text(), "nm_cidade": Text(),
+        "sg_estado": Text(), "nm_regiao": Text(), "vl_meta_mensal": DINHEIRO,
+    },
+    "dim_produto": {
+        "sk_produto": Integer(), "nm_produto": Text(), "nm_categoria": Text(), "ds_estilo": Text(),
+    },
+    "fato_vendas": {
+        "id_fato": BigInteger(), "sk_data": Integer(), "sk_loja": Integer(),
+        "sk_produto": Integer(), "cd_venda": BigInteger(), "vl_quantidade": Integer(),
+        "vl_preco_unit": DINHEIRO, "vl_final": DINHEIRO,
+    },
+}
+
+# Restrições do Star Schema, aplicadas após a carga
+DDL_RESTRICOES = [
+    "ALTER TABLE dim_tempo   ADD CONSTRAINT pk_dim_tempo   PRIMARY KEY (sk_data)",
+    "ALTER TABLE dim_loja    ADD CONSTRAINT pk_dim_loja    PRIMARY KEY (sk_loja)",
+    "ALTER TABLE dim_produto ADD CONSTRAINT pk_dim_produto PRIMARY KEY (sk_produto)",
+    "ALTER TABLE fato_vendas ADD CONSTRAINT pk_fato_vendas PRIMARY KEY (id_fato)",
+    "ALTER TABLE fato_vendas ADD CONSTRAINT fk_fato_tempo   FOREIGN KEY (sk_data)    REFERENCES dim_tempo (sk_data)",
+    "ALTER TABLE fato_vendas ADD CONSTRAINT fk_fato_loja    FOREIGN KEY (sk_loja)    REFERENCES dim_loja (sk_loja)",
+    "ALTER TABLE fato_vendas ADD CONSTRAINT fk_fato_produto FOREIGN KEY (sk_produto) REFERENCES dim_produto (sk_produto)",
+    "CREATE INDEX ix_fato_vendas_sk_data    ON fato_vendas (sk_data)",
+    "CREATE INDEX ix_fato_vendas_sk_loja    ON fato_vendas (sk_loja)",
+    "CREATE INDEX ix_fato_vendas_sk_produto ON fato_vendas (sk_produto)",
+]
 
 
 def get_engine():
@@ -48,25 +64,25 @@ def get_engine():
 
 
 def ler_prata(s3, tabela: str, dt_ingestao: str) -> pd.DataFrame:
-    key = f"{tabela}/dt_ingestao={dt_ingestao}/{tabela}.parquet"
-    resp = s3.get_object(Bucket=BUCKET_PRATA, Key=key)
-    return pd.read_parquet(io.BytesIO(resp["Body"].read()))
+    return ler_parquet(s3, BUCKET_PRATA, chave_particao(tabela, dt_ingestao))
 
 
-def gravar_ouro(s3, engine, df: pd.DataFrame, tabela: str) -> int:
-    # 1. Grava Parquet no Object Storage (bucket ouro)
-    key = f"{tabela}/{tabela}.parquet"
-    table = pa.Table.from_pandas(df, preserve_index=False)
-    buf = io.BytesIO()
-    pq.write_table(table, buf, compression="snappy")
-    buf.seek(0)
-    s3.put_object(Bucket=BUCKET_OURO, Key=key, Body=buf.getvalue())
+def carregar_postgres(engine, tabelas: dict[str, pd.DataFrame]) -> None:
+    """Recarrega o Star Schema no PostgreSQL em uma única transação.
 
-    # 2. Carrega no PostgreSQL (dw_vendas) para consumo do Superset
-    df.to_sql(tabela, engine, if_exists="replace", index=False)
-
-    log.info(f"    ✓ {len(df):,} linhas → s3://{BUCKET_OURO}/{key} & postgres.{tabela}")
-    return len(df)
+    Se qualquer etapa falhar, nada é alterado no banco (o Superset continua
+    enxergando a carga anterior completa).
+    """
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "DROP TABLE IF EXISTS fato_vendas, dim_tempo, dim_loja, dim_produto CASCADE"
+        )
+        for nome, df in tabelas.items():
+            df.to_sql(nome, conn, if_exists="fail", index=False, dtype=TIPOS_SQL[nome])
+            log.info(f"    ✓ {len(df):,} linhas → postgres.{nome}")
+        for ddl in DDL_RESTRICOES:
+            conn.exec_driver_sql(ddl)
+        log.info("    ✓ Chaves primárias, estrangeiras e índices criados")
 
 
 def construir_dim_tempo(datas: pd.Series) -> pd.DataFrame:
@@ -134,11 +150,15 @@ def construir_fato_vendas(
     df["sk_produto"] = df["produto"].map(mapa_produto)
     df = df.reset_index(drop=True)
 
+    sem_chave = df[["sk_loja", "sk_produto"]].isna().any(axis=1)
+    if sem_chave.any():
+        raise ValueError(f"{int(sem_chave.sum())} linhas da fato sem chave de dimensão (loja/produto)")
+
     return pd.DataFrame({
         "id_fato": df.index + 1,
         "sk_data": df["sk_data"],
-        "sk_loja": df["sk_loja"],
-        "sk_produto": df["sk_produto"],
+        "sk_loja": df["sk_loja"].astype(int),
+        "sk_produto": df["sk_produto"].astype(int),
         "cd_venda": df["codigo_venda"],
         "vl_quantidade": df["quantidade"],
         "vl_preco_unit": df["valor_unitario"],
@@ -147,18 +167,15 @@ def construir_fato_vendas(
 
 
 def executar_ouro(dt_ingestao: str | None = None) -> list[dict]:
-    if dt_ingestao is None:
-        dt_ingestao = date.today().isoformat()
-
     log.info("=" * 60)
     log.info(" OURO — Modelagem Dimensional (Star Schema)")
     log.info("=" * 60)
 
     s3 = get_s3()
-    engine = get_engine()
     metricas = []
 
     try:
+        dt_ingestao = resolver_particao(s3, BUCKET_PRATA, "vendas_integradas", dt_ingestao)
         vendas_prata = ler_prata(s3, "vendas_integradas", dt_ingestao)
         lojas_prata = ler_prata(s3, "lojas_integradas", dt_ingestao)
 
@@ -174,9 +191,16 @@ def executar_ouro(dt_ingestao: str | None = None) -> list[dict]:
             "fato_vendas": fato_vendas,
         }
 
+        # 1. Serving (PostgreSQL) em transação única; 2. Parquet no bucket ouro.
+        # O Parquet só é atualizado depois que o banco foi carregado com sucesso.
+        log.info("  ▸ Carregando Star Schema no PostgreSQL (transação única)...")
+        carregar_postgres(get_engine(), tabelas)
+
+        log.info("  ▸ Gravando Parquet no bucket ouro...")
         for nome, df in tabelas.items():
-            log.info(f"  ▸ Persistindo {nome}...")
-            linhas = gravar_ouro(s3, engine, df, nome)
+            key = f"{nome}/{nome}.parquet"
+            linhas = gravar_parquet(s3, df, BUCKET_OURO, key)
+            log.info(f"    ✓ {linhas:,} linhas → s3://{BUCKET_OURO}/{key}")
             metricas.append({"tabela": nome, "linhas": linhas, "status": "ok"})
 
         log.info("\n  Resumo Fato Vendas (Camada Ouro):")

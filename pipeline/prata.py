@@ -1,20 +1,9 @@
-import io
 import logging
-from datetime import date
 
-import boto3
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
-from botocore.config import Config
 
-from config import (
-    S3_ENDPOINT,
-    S3_ACCESS_KEY,
-    S3_SECRET_KEY,
-    BUCKET_BRONZE,
-    BUCKET_PRATA,
-)
+from config import BUCKET_BRONZE, BUCKET_PRATA
+from storage import chave_particao, get_s3, gravar_parquet, ler_parquet, resolver_particao
 
 log = logging.getLogger(__name__)
 
@@ -43,55 +32,37 @@ MAPA_CATEGORIA = {
 ESTILOS = ("Estampa", "Linho", "Liso", "Listrado", "Xadrez")
 
 
-def get_s3():
-    return boto3.client(
-        "s3",
-        endpoint_url=S3_ENDPOINT,
-        aws_access_key_id=S3_ACCESS_KEY,
-        aws_secret_access_key=S3_SECRET_KEY,
-        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
-        region_name="us-east-1",
-    )
-
-
 def ler_bronze(s3, tabela: str, dt_ingestao: str) -> pd.DataFrame:
-    s3_key = f"{tabela}/dt_ingestao={dt_ingestao}/{tabela}.parquet"
-    resp = s3.get_object(Bucket=BUCKET_BRONZE, Key=s3_key)
-    return pd.read_parquet(io.BytesIO(resp["Body"].read()))
+    return ler_parquet(s3, BUCKET_BRONZE, chave_particao(tabela, dt_ingestao))
 
 
 def gravar_prata(s3, df: pd.DataFrame, tabela: str, dt_ingestao: str) -> int:
-    s3_key = f"{tabela}/dt_ingestao={dt_ingestao}/{tabela}.parquet"
-    table = pa.Table.from_pandas(df, preserve_index=False)
-    buf = io.BytesIO()
-    pq.write_table(table, buf, compression="snappy")
-    buf.seek(0)
-    s3.put_object(Bucket=BUCKET_PRATA, Key=s3_key, Body=buf.getvalue())
-    log.info(f"    ✓ {len(df):,} linhas → s3://{BUCKET_PRATA}/{s3_key}")
-    return len(df)
+    s3_key = chave_particao(tabela, dt_ingestao)
+    linhas = gravar_parquet(s3, df, BUCKET_PRATA, s3_key)
+    log.info(f"    ✓ {linhas:,} linhas → s3://{BUCKET_PRATA}/{s3_key}")
+    return linhas
 
 
 def classificar_produto(nome: str) -> tuple[str, str]:
-    primeira_palavra = nome.split()[0]
-    categoria = MAPA_CATEGORIA.get(primeira_palavra, "Outros")
+    partes = nome.split()
+    categoria = MAPA_CATEGORIA.get(partes[0], "Outros") if partes else "Outros"
     estilo = next((e for e in ESTILOS if nome.endswith(e)), "Padrão")
     return categoria, estilo
 
 
 def executar_prata(dt_ingestao: str | None = None) -> list[dict]:
-    if dt_ingestao is None:
-        dt_ingestao = date.today().isoformat()
-
     log.info("=" * 60)
     log.info(" PRATA — Saneamento, deduplicação e integração")
-    log.info(f" Partição: dt_ingestao={dt_ingestao}")
-    log.info("=" * 60)
 
     s3 = get_s3()
     metricas = []
 
     try:
-        # 1. Leitura da Bronze
+        dt_ingestao = resolver_particao(s3, BUCKET_BRONZE, "vendas", dt_ingestao)
+        log.info(f" Partição: dt_ingestao={dt_ingestao}")
+        log.info("=" * 60)
+
+        # 1. Leitura da Bronze (todas as colunas chegam como texto)
         df_vendas = ler_bronze(s3, "vendas", dt_ingestao)
         df_lojas = ler_bronze(s3, "lojas", dt_ingestao)
         df_metas = ler_bronze(s3, "metas_lojas", dt_ingestao)
@@ -114,6 +85,10 @@ def executar_prata(dt_ingestao: str | None = None) -> list[dict]:
                 how="left",
             )
         )
+        sem_meta = lojas_integradas.loc[lojas_integradas["meta_mensal"].isna(), "id_loja"].tolist()
+        if sem_meta:
+            log.warning(f"  ! Lojas sem meta cadastrada: {sem_meta}")
+
         linhas_lojas = gravar_prata(s3, lojas_integradas, "lojas_integradas", dt_ingestao)
         metricas.append({"tabela": "lojas_integradas", "linhas": linhas_lojas, "status": "ok"})
 
@@ -130,21 +105,40 @@ def executar_prata(dt_ingestao: str | None = None) -> list[dict]:
         vendas = df_vendas[colunas_negocio].copy()
         vendas["id_loja"] = vendas["id_loja"].astype(str).str.strip()
         vendas["produto"] = vendas["produto"].astype(str).str.strip()
-        vendas["data"] = pd.to_datetime(vendas["data"]).dt.date
+        vendas["data"] = pd.to_datetime(vendas["data"], format="%Y-%m-%d").dt.date
         vendas["codigo_venda"] = vendas["codigo_venda"].astype(int)
         vendas["quantidade"] = vendas["quantidade"].astype(int)
         vendas["valor_unitario"] = vendas["valor_unitario"].astype(float).round(2)
+
+        # valor_final é recalculado a partir de quantidade × valor_unitario
+        valor_final_origem = vendas["valor_final"].astype(float)
         vendas["valor_final"] = (vendas["quantidade"] * vendas["valor_unitario"]).round(2)
+        divergentes = int(((valor_final_origem - vendas["valor_final"]).abs() > 0.01).sum())
+        log.info(f"  ▸ valor_final divergente de quantidade × valor_unitario: {divergentes}")
+
+        # Regras de qualidade: quantidade e preço devem ser positivos
+        invalidas = (vendas["quantidade"] <= 0) | (vendas["valor_unitario"] <= 0)
+        if invalidas.any():
+            log.warning(f"  ! Linhas descartadas por quantidade/preço inválidos: {int(invalidas.sum())}")
+            vendas = vendas.loc[~invalidas]
 
         antes = len(vendas)
         vendas = vendas.drop_duplicates().reset_index(drop=True)
         removidas = antes - len(vendas)
         log.info(f"  ▸ Duplicatas exatas removidas em vendas: {removidas} ({antes:,} → {len(vendas):,})")
 
+        # Integridade referencial: toda venda precisa de uma loja cadastrada
+        lojas_desconhecidas = sorted(set(vendas["id_loja"]) - set(lojas_integradas["id_loja"]))
+        if lojas_desconhecidas:
+            raise ValueError(f"Vendas com lojas sem cadastro: {lojas_desconhecidas}")
+
         # 4. Enriquecimento de Produto + Integração com Lojas
-        classificacao = vendas["produto"].apply(classificar_produto)
-        vendas["categoria"] = [c[0] for c in classificacao]
-        vendas["estilo"] = [c[1] for c in classificacao]
+        classificacao = {p: classificar_produto(p) for p in vendas["produto"].unique()}
+        vendas["categoria"] = vendas["produto"].map(lambda p: classificacao[p][0])
+        vendas["estilo"] = vendas["produto"].map(lambda p: classificacao[p][1])
+        sem_categoria = sorted(p for p, (cat, _) in classificacao.items() if cat == "Outros")
+        if sem_categoria:
+            log.warning(f"  ! Produtos sem categoria mapeada (→ 'Outros'): {sem_categoria}")
 
         vendas_integradas = vendas.merge(lojas_integradas, on="id_loja", how="left")
         linhas_vendas = gravar_prata(s3, vendas_integradas, "vendas_integradas", dt_ingestao)
